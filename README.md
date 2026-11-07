@@ -2,7 +2,13 @@
 
 Et Lovelace-card der finder entities ud fra filtre og viser dem med et card du selv vælger – enten **ét card pr. entity** (fx `tile` i et grid) eller **ét samlet card** med hele listen (fx `entities`, `glance` eller `history-graph`).
 
-Kortet har en visuel editor, så det kan sættes op direkte i dashboard-editoren.
+Kortet har en visuel editor, så det kan sættes op direkte i dashboard-editoren:
+
+- **Filtre** bygges med regler, hvor du vælger domain, område, etage, enhed og label.
+- **Card** vælges i Home Assistants egen card-vælger. Den viser alle indbyggede cards og custom cards fra HACS.
+- Det valgte cards **egen visuelle editor** vises direkte i kortet, så du kan sætte det op som normalt, fx features på et tile-card. Med "Vis YAML" kan du redigere det som YAML i stedet.
+
+I editoren vises den første matchende entity (eller hele listen) som eksempel, så kortets egen editor og preview har noget at arbejde med. Den gemmes ikke i konfigurationen: hvert card får automatisk sin egen entity.
 
 ## Installation
 
@@ -64,7 +70,7 @@ layout: grid        # grid | vertical-stack | horizontal-stack
 columns: 3
 ```
 
-`entity` sættes automatisk på hvert card. Skal entity-id'et bruges et andet sted, skriver du `this.entity_id` – så bliver det erstattet i hele card-konfigurationen (og `entity` sættes ikke automatisk):
+`entity` sættes automatisk på hvert card, også hvis cardet selv har en `entity`. Skal entity-id'et bruges et andet sted, skriver du `this.entity_id` – så bliver det erstattet i hele card-konfigurationen (og `entity` sættes ikke automatisk):
 
 ```yaml
 card:
