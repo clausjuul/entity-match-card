@@ -6,11 +6,27 @@
  * entity eller ét samlet card med hele listen.
  */
 
-const CARD_VERSION = "0.2.0";
+const CARD_VERSION = "0.3.0";
 const CARD_TYPE = "entity-match-card";
 const EDITOR_TYPE = "entity-match-card-editor";
 
-const RULE_KEYS = ["domain", "entity_id", "name", "area", "floor", "device", "label"];
+/** Betingelser hvor værdien er en liste af mønstre. */
+const RULE_KEYS = [
+  "domain",
+  "entity_id",
+  "name",
+  "area",
+  "floor",
+  "device",
+  "label",
+  "state",
+  "supports",
+];
+/** Alle felter en regel kan have (også attribute/value). */
+const ALL_RULE_KEYS = [...RULE_KEYS, "attribute", "value"];
+
+/** Farvetilstande fra light.supported_color_modes. */
+const COLOR_MODES = ["hs", "xy", "rgb", "rgbw", "rgbww"];
 
 /* ------------------------------------------------------------------ */
 /* Matching                                                            */
@@ -74,6 +90,7 @@ function entityContext(hass, entityId, labelNames) {
   const floorId = area && area.floor_id ? area.floor_id : undefined;
   const floor = floorId && hass.floors ? hass.floors[floorId] : undefined;
   const labels = toList(reg.labels);
+  const attributes = (stateObj && stateObj.attributes) || {};
   return {
     entity_id: entityId,
     domain: entityId.split(".")[0],
@@ -85,7 +102,30 @@ function entityContext(hass, entityId, labelNames) {
     floor: floorId ? [floorId, floor && floor.name] : [],
     device: device ? [device.id, device.name_by_user, device.name] : [],
     label: labels.flatMap((id) => [id, labelNames && labelNames[id]]),
+    state: stateObj ? stateObj.state : undefined,
+    supports: computeSupports(attributes),
+    attributes,
   };
+}
+
+/** Hvad en entity kan: "color", "color_temp", "brightness". */
+function computeSupports(attributes) {
+  const modes = toList(attributes.supported_color_modes);
+  const out = [];
+  if (modes.some((m) => COLOR_MODES.includes(m))) out.push("color");
+  if (modes.includes("color_temp")) out.push("color_temp");
+  if (modes.some((m) => m !== "onoff") || attributes.brightness !== undefined) {
+    out.push("brightness");
+  }
+  return out;
+}
+
+/** Kandidatværdier for en attribut – lister og objekter foldes ud. */
+function attributeCandidates(value) {
+  if (value === undefined || value === null) return [];
+  if (Array.isArray(value)) return value.flatMap(attributeCandidates);
+  if (typeof value === "object") return [JSON.stringify(value)];
+  return [value];
 }
 
 /** En regel matcher hvis ALLE angivne betingelser matcher (AND). */
@@ -101,14 +141,25 @@ function ruleMatches(rule, ctx) {
       return false;
     }
   }
+  const attribute = typeof rule.attribute === "string" ? rule.attribute.trim() : "";
+  if (attribute) {
+    hasCondition = true;
+    const raw = ctx.attributes ? ctx.attributes[attribute] : undefined;
+    const values = toList(rule.value);
+    if (values.length) {
+      if (!anyMatch(values, attributeCandidates(raw))) return false;
+    } else if (raw === undefined || raw === null) {
+      return false; // uden værdi: attributten skal blot findes
+    }
+  }
   return hasCondition;
 }
 
 /**
- * Returnerer de entity_ids der matcher config.filter.
+ * Returnerer kontekst for de entities der matcher config.filter.
  * include-regler er OR'et sammen, exclude-regler fjerner.
  */
-function findEntities(hass, config, labelNames) {
+function findEntityContexts(hass, config, labelNames) {
   const filter = config.filter || {};
   const include = toList(filter.include);
   const exclude = toList(filter.exclude);
@@ -137,9 +188,20 @@ function findEntities(hass, config, labelNames) {
   }
   if (config.sort_reverse) matches.reverse();
 
-  const ids = matches.map((c) => c.entity_id);
   const limit = Number(config.limit);
-  return limit > 0 ? ids.slice(0, limit) : ids;
+  return limit > 0 ? matches.slice(0, limit) : matches;
+}
+
+/** Som findEntityContexts, men returnerer kun entity_ids. */
+function findEntities(hass, config, labelNames) {
+  return findEntityContexts(hass, config, labelNames).map((c) => c.entity_id);
+}
+
+/** Den første variant hvis betingelse matcher, ellers undefined. */
+function pickVariant(config, ctx) {
+  return toList(config.variants).find(
+    (v) => v && v.card && v.card.type && ruleMatches(v.when, ctx)
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -160,22 +222,27 @@ function fillTemplate(value, entityId) {
   return value;
 }
 
-function buildChildConfig(config, entityIds) {
+/** Et card til én entity ud fra en skabelon. */
+function cardForEntity(template, id) {
+  const card = fillTemplate(template, id);
+  // Hvert card får sin egen entity – også selvom skabelonen har en fra
+  // card-vælgerens standardkonfiguration.
+  if (!JSON.stringify(template).includes(PLACEHOLDER)) card.entity = id;
+  return card;
+}
+
+function buildChildConfig(config, contexts) {
   const template = config.card || { type: config.mode === "list" ? "entities" : "tile" };
 
   if (config.mode === "list") {
     const param = config.card_param || "entities";
-    return { ...template, [param]: entityIds };
+    return { ...template, [param]: contexts.map((c) => c.entity_id) };
   }
 
-  // mode: each – ét card pr. entity, samlet i et layout-card.
-  const usesPlaceholder = JSON.stringify(template).includes(PLACEHOLDER);
-  const cards = entityIds.map((id) => {
-    const card = fillTemplate(template, id);
-    // Hvert card får sin egen entity – også selvom skabelonen har en fra
-    // card-vælgerens standardkonfiguration.
-    if (!usesPlaceholder) card.entity = id;
-    return card;
+  // mode: each – ét card pr. entity (evt. fra en variant), samlet i et layout-card.
+  const cards = contexts.map((ctx) => {
+    const variant = pickVariant(config, ctx);
+    return cardForEntity(variant ? variant.card : template, ctx.entity_id);
   });
   const layout = config.layout || "grid";
   const layoutConfig = { type: layout, cards };
@@ -245,6 +312,14 @@ class EntityMatchCard extends HTMLElement {
     if (config.mode && !["each", "list"].includes(config.mode)) {
       throw new Error("'mode' skal være 'each' eller 'list'");
     }
+    if (config.variants !== undefined && !Array.isArray(config.variants)) {
+      throw new Error("'variants' skal være en liste af { when, card }");
+    }
+    for (const v of toList(config.variants)) {
+      if (!v || typeof v !== "object" || (v.card !== undefined && typeof v.card !== "object")) {
+        throw new Error("Hver variant skal have 'when' (betingelser) og 'card'");
+      }
+    }
     this._config = { mode: "each", ...config };
     this._childKey = undefined;
     this._update();
@@ -274,15 +349,15 @@ class EntityMatchCard extends HTMLElement {
 
   _update() {
     if (!this._config || !this._hass) return;
-    const entities = findEntities(this._hass, this._config, labelNames);
-    this._entities = entities;
+    const contexts = findEntityContexts(this._hass, this._config, labelNames);
+    this._entities = contexts.map((c) => c.entity_id);
 
-    if (!entities.length) {
+    if (!contexts.length) {
       this._renderEmpty();
       return;
     }
 
-    const childConfig = buildChildConfig(this._config, entities);
+    const childConfig = buildChildConfig(this._config, contexts);
     const key = JSON.stringify(childConfig);
     if (key !== this._childKey) {
       this._childKey = key;
@@ -349,6 +424,10 @@ const LABELS = {
   floor: "Etage",
   device: "Enhed",
   label: "Label",
+  supports: "Understøtter",
+  state: "Tilstand (mønster, fx on)",
+  attribute: "Attribut (fx supported_color_modes)",
+  value: "Attributværdi (mønster – tom = attributten findes)",
   mode: "Visning",
   card_type: "Card-type",
   card: "Card-konfiguration (YAML)",
@@ -372,6 +451,12 @@ const HELPERS = {
 
 const DEFAULT_CARD = { each: "tile", list: "entities" };
 
+const SUPPORTS_OPTIONS = [
+  { value: "color", label: "Farve" },
+  { value: "color_temp", label: "Farvetemperatur" },
+  { value: "brightness", label: "Dæmpning" },
+];
+
 function ruleSchema(domains) {
   return [
     {
@@ -386,6 +471,20 @@ function ruleSchema(domains) {
     { name: "floor", selector: { floor: { multiple: true } } },
     { name: "device", selector: { device: { multiple: true } } },
     { name: "label", selector: { label: { multiple: true } } },
+    {
+      name: "supports",
+      selector: { select: { multiple: true, mode: "list", options: SUPPORTS_OPTIONS } },
+    },
+    {
+      type: "expandable",
+      name: "",
+      title: "Avanceret: tilstand og attributter",
+      schema: [
+        { name: "state", selector: { text: { multiple: true } } },
+        { name: "attribute", selector: { text: {} } },
+        { name: "value", selector: { text: { multiple: true } } },
+      ],
+    },
   ];
 }
 
@@ -490,6 +589,19 @@ const EDITOR_STYLE = `
   button.link[disabled] { color: var(--disabled-text-color, #999); cursor: default; }
   button.remove { color: var(--error-color, #db4437); }
   .count { color: var(--secondary-text-color); font-size: 13px; }
+  .tabs {
+    display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px;
+  }
+  .tabs button {
+    border: 1px solid var(--divider-color, #ddd); border-radius: 16px;
+    background: none; color: var(--primary-text-color); cursor: pointer;
+    font: inherit; font-size: 13px; padding: 4px 12px;
+  }
+  .tabs button.active {
+    background: var(--primary-color); border-color: var(--primary-color);
+    color: var(--text-primary-color, #fff);
+  }
+  .tabs button.add { border-style: dashed; color: var(--primary-color); }
 `;
 
 /** Venter på at et HA-element er defineret og henter dets editor. */
@@ -581,6 +693,7 @@ class EntityMatchCardEditor extends HTMLElement {
     this._guiModeAvailable = true;
     this._cardEditor = undefined;
     this._cardJson = undefined;
+    this._cardTab = 0; // 0 = standard-card, n = variants[n - 1]
   }
 
   setConfig(config) {
@@ -662,6 +775,12 @@ class EntityMatchCardEditor extends HTMLElement {
       const list = toList(rule[key]).filter((v) => String(v).trim() !== "");
       if (list.length) out[key] = list;
     }
+    const attribute = typeof rule.attribute === "string" ? rule.attribute.trim() : "";
+    if (attribute) {
+      out.attribute = attribute;
+      const values = toList(rule.value).filter((v) => String(v).trim() !== "");
+      if (values.length) out.value = values;
+    }
     return out;
   }
 
@@ -696,6 +815,8 @@ class EntityMatchCardEditor extends HTMLElement {
     if (value.mode !== prevMode) {
       // Et card til den ene visning passer sjældent til den anden.
       next.card = { type: DEFAULT_CARD[value.mode] };
+      delete next.variants;
+      this._cardTab = 0;
     }
 
     if (value.mode === "each") {
@@ -739,18 +860,92 @@ class EntityMatchCardEditor extends HTMLElement {
     return this._hass ? findEntities(this._hass, this._config, labelNames) : [];
   }
 
+  _contexts() {
+    return this._hass ? findEntityContexts(this._hass, this._config, labelNames) : [];
+  }
+
+  _variants() {
+    return this._mode() === "each" ? toList(this._config.variants) : [];
+  }
+
+  _tab() {
+    const tab = Math.min(this._cardTab, this._variants().length);
+    return Math.max(0, tab);
+  }
+
+  /** Card-skabelonen for den valgte fane. */
+  _tabCard() {
+    const tab = this._tab();
+    if (!tab) return this._config.card || {};
+    return this._variants()[tab - 1].card || {};
+  }
+
+  /** Antal entities pr. fane: [standard, variant 1, ...]. */
+  _tabCounts() {
+    const counts = new Array(this._variants().length + 1).fill(0);
+    for (const ctx of this._contexts()) {
+      const variant = pickVariant(this._config, ctx);
+      counts[variant ? this._variants().indexOf(variant) + 1 : 0] += 1;
+    }
+    return counts;
+  }
+
+  _setVariants(variants) {
+    const next = { ...this._config };
+    if (variants.length) next.variants = variants;
+    else delete next.variants;
+    this._config = next;
+    this._fire();
+  }
+
+  _addVariant() {
+    const variants = this._variants().slice();
+    variants.push({ when: { supports: ["color"] }, card: clone(this._config.card || { type: "tile" }) });
+    this._cardTab = variants.length;
+    this._picking = false;
+    this._setVariants(variants);
+    this._render(true);
+  }
+
+  _removeVariant(index) {
+    const variants = this._variants().slice();
+    variants.splice(index, 1);
+    this._cardTab = 0;
+    this._picking = false;
+    this._setVariants(variants);
+    this._render(true);
+  }
+
+  _selectTab(tab) {
+    if (tab === this._tab()) return;
+    this._cardTab = tab;
+    this._picking = false;
+    this._render(true);
+  }
+
   /**
    * Konfigurationen vist i card-editoren: skabelonen plus den første
    * matchende entity (ét card pr. entity) eller hele listen (samlet card),
    * så editoren og dens preview har noget at arbejde med.
    */
   _editorValue() {
-    const card = clone(this._config.card || { type: DEFAULT_CARD[this._mode()] });
-    const matches = this._matches();
+    const tabCard = this._tabCard();
+    const card = clone(tabCard.type ? tabCard : { type: DEFAULT_CARD[this._mode()] });
+    const contexts = this._contexts();
     if (this._mode() === "list") {
-      card[this._config.card_param || "entities"] = matches;
-    } else if (!JSON.stringify(card).includes(PLACEHOLDER) && matches.length) {
-      card.entity = matches[0];
+      card[this._config.card_param || "entities"] = contexts.map((c) => c.entity_id);
+    } else if (!JSON.stringify(card).includes(PLACEHOLDER) && contexts.length) {
+      // Brug en entity der faktisk vises med dette card som eksempel.
+      const tab = this._tab();
+      const variants = this._variants();
+      const sample =
+        contexts.find((ctx) => {
+          const variant = pickVariant(this._config, ctx);
+          return tab ? variant === variants[tab - 1] : !variant;
+        }) ||
+        (tab ? contexts.find((ctx) => ruleMatches(variants[tab - 1].when, ctx)) : undefined) ||
+        contexts[0];
+      card.entity = sample.entity_id;
     }
     return card;
   }
@@ -767,7 +962,14 @@ class EntityMatchCardEditor extends HTMLElement {
   }
 
   _setCard(card) {
-    this._config = { ...this._config, card };
+    const tab = this._tab();
+    if (!tab) {
+      this._config = { ...this._config, card };
+    } else {
+      const variants = this._variants().slice();
+      variants[tab - 1] = { ...variants[tab - 1], card };
+      this._config = { ...this._config, variants };
+    }
     this._cardJson = JSON.stringify(card);
     this._fire();
   }
@@ -779,8 +981,72 @@ class EntityMatchCardEditor extends HTMLElement {
     setTimeout(() => this._render(true), 0);
   }
 
+  _renderTabs(section) {
+    const tabs = document.createElement("div");
+    tabs.className = "tabs";
+    const tab = this._tab();
+    const names = ["Standard", ...this._variants().map((_, i) => `Variant ${i + 1}`)];
+    names.forEach((name, i) => {
+      const btn = document.createElement("button");
+      btn.className = i === tab ? "tab active" : "tab";
+      btn.dataset.name = name;
+      btn.dataset.index = String(i);
+      btn.textContent = name;
+      btn.addEventListener("click", () => this._selectTab(i));
+      tabs.appendChild(btn);
+    });
+    const add = document.createElement("button");
+    add.className = "add";
+    add.textContent = "+ Tilføj variant";
+    add.addEventListener("click", () => this._addVariant());
+    tabs.appendChild(add);
+    section.appendChild(tabs);
+
+    const hint = document.createElement("p");
+    hint.className = "hint";
+    if (!tab) {
+      hint.textContent = this._variants().length
+        ? "Standard-cardet bruges til de entities der ikke matcher nogen variant."
+        : "Tilføj en variant for at vise nogle entities med et andet card – fx lys der understøtter farve.";
+      section.appendChild(hint);
+      return;
+    }
+
+    hint.textContent =
+      "Entities der matcher betingelsen vises med variantens card. Den første variant der matcher bruges.";
+    section.appendChild(hint);
+    const index = tab - 1;
+    const box = document.createElement("div");
+    box.className = "rule";
+    const head = document.createElement("div");
+    head.className = "rule-head";
+    const title = document.createElement("span");
+    title.textContent = "Betingelse";
+    const remove = document.createElement("button");
+    remove.className = "link remove";
+    remove.textContent = "Fjern variant";
+    remove.addEventListener("click", () => this._removeVariant(index));
+    head.append(title, remove);
+    box.appendChild(head);
+    const form = this._makeForm(
+      ruleSchema(this._domains || []),
+      this._variants()[index].when || {},
+      (value) => {
+        const variants = this._variants().slice();
+        variants[index] = { ...variants[index], when: this._cleanRule(value) };
+        this._setVariants(variants);
+        this._updateCount();
+      }
+    );
+    form.dataset.kind = "variant";
+    form.dataset.index = String(index);
+    box.appendChild(form);
+    section.appendChild(box);
+  }
+
   _renderCardSection(section) {
-    const card = this._config.card || {};
+    if (this._mode() === "each") this._renderTabs(section);
+    const card = this._tabCard();
     const head = document.createElement("div");
     head.className = "card-head";
     const name = document.createElement("span");
@@ -865,7 +1131,7 @@ class EntityMatchCardEditor extends HTMLElement {
     editor.hass = this._hass;
     editor.lovelace = this._lovelace;
     editor.value = this._editorValue();
-    this._cardJson = JSON.stringify(this._config.card || {});
+    this._cardJson = JSON.stringify(this._tabCard());
     editor.addEventListener("config-changed", (ev) => {
       ev.stopPropagation();
       const detail = ev.detail || {};
@@ -876,6 +1142,8 @@ class EntityMatchCardEditor extends HTMLElement {
       if (!detail.config || detail.error) return;
       this._setCard(this._stripEditorValue(detail.config));
       this._updateCount();
+      const name = this._root.querySelector(".card-head .name");
+      if (name) name.textContent = cardDisplayName(this._tabCard().type);
     });
     editor.addEventListener("GUImode-changed", (ev) => {
       ev.stopPropagation();
@@ -903,6 +1171,13 @@ class EntityMatchCardEditor extends HTMLElement {
     if (!el || !this._hass) return;
     const n = this._matches().length;
     el.textContent = `${n} ${n === 1 ? "entity matcher" : "entities matcher"} filteret lige nu.`;
+    const tabs = this._root.querySelectorAll(".tabs button.tab");
+    if (tabs.length) {
+      const counts = this._tabCounts();
+      tabs.forEach((btn) => {
+        btn.textContent = `${btn.dataset.name} (${counts[Number(btn.dataset.index)] || 0})`;
+      });
+    }
   }
 
   /* ---------------- Rendering ---------------- */
@@ -917,7 +1192,9 @@ class EntityMatchCardEditor extends HTMLElement {
       this._rules("exclude").length,
       this._mode(),
       this._picking,
-      Boolean((this._config.card || {}).type),
+      this._variants().length,
+      this._tab(),
+      Boolean(this._tabCard().type),
       Boolean(this._domains),
       Boolean(customElements.get("ha-form")),
       hasCardEditor(),
@@ -930,17 +1207,20 @@ class EntityMatchCardEditor extends HTMLElement {
         if (kind === "display") f.data = this._displayData();
         else if (kind === "options") f.data = this._optionsData();
         else if (kind === "card") {
-          const card = this._config.card || {};
+          const card = this._tabCard();
           f.data = { card_type: card.type || "", card };
+        } else if (kind === "variant") {
+          const variant = this._variants()[Number(f.dataset.index)];
+          f.data = (variant && variant.when) || {};
         } else if (kind) f.data = this._rules(kind)[Number(f.dataset.index)] || {};
       });
       // Card ændret udefra (fx i dashboard-editorens YAML) – opdatér editoren.
-      const cardJson = JSON.stringify(this._config.card || {});
+      const cardJson = JSON.stringify(this._tabCard());
       if (this._cardEditor && cardJson !== this._cardJson) {
         this._cardJson = cardJson;
         this._cardEditor.value = this._editorValue();
         const name = this._root.querySelector(".card-head .name");
-        if (name) name.textContent = cardDisplayName((this._config.card || {}).type);
+        if (name) name.textContent = cardDisplayName(this._tabCard().type);
       }
       this._updateCount();
       return;

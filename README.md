@@ -44,6 +44,9 @@ Alle udfyldte felter i en regel skal matche (AND). Hvert felt kan være én vær
 | `floor` | Etage (id eller navn) via området |
 | `device` | Enhed (id, navn eller eget navn) |
 | `label` | Label (id eller navn) |
+| `supports` | Hvad entity'en kan: `color` (farve), `color_temp` (farvetemperatur), `brightness` (dæmpning). Læses fra lysets `supported_color_modes` |
+| `state` | Tilstand, fx `on` |
+| `attribute` + `value` | En vilkårlig attribut. Uden `value` skal attributten blot findes. Lister matcher hvis ét element matcher |
 
 Værdier kan være:
 - **eksakte** (uden forskel på store/små bogstaver): `light.kitchen`
@@ -83,6 +86,31 @@ card:
       entity_id: this.entity_id
 ```
 
+### Varianter – forskelligt card afhængigt af entity'en
+
+Med `variants` kan nogle entities vises med et andet card end standard-cardet. Hver variant har en betingelse (`when`, samme felter som filtrene) og et `card`. Den første variant der matcher bruges; resten får standard-cardet. Alle vises stadig i samme layout og sortering.
+
+```yaml
+type: custom:entity-match-card
+filter:
+  include:
+    - domain: light
+mode: each
+card:                       # hvide/dæmpbare lys
+  type: tile
+  features:
+    - type: light-brightness
+variants:
+  - when:
+      supports: color       # lys der understøtter farve
+    card:
+      type: custom:mushroom-light-card
+      show_color_control: true
+      show_brightness_control: true
+```
+
+I editoren ligger varianterne som faner under **Card** (Standard, Variant 1, …) med antallet af entities der rammer hver fane.
+
 ### Ét samlet card (`mode: list`)
 
 ```yaml
@@ -110,6 +138,7 @@ Listen sættes ind i `entities`. Bruger kortet et andet felt, angiv det med `car
 | `layout` | `grid` | Kun `each`: `grid`, `vertical-stack`, `horizontal-stack` |
 | `columns` | auto | Kun `grid` |
 | `square` | `false` | Kun `grid` |
+| `variants` | – | Kun `each`: liste af `{ when, card }` |
 | `card_param` | `entities` | Kun `list`: feltet der modtager listen |
 | `sort` | `name` | `name`, `entity_id`, `area` eller `none` |
 | `sort_reverse` | `false` | Omvendt rækkefølge |
